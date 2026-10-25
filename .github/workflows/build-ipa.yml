@@ -1,0 +1,42 @@
+name: Build unsigned iOS probe
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        run: xcodegen generate --spec project.yml
+      - name: Compile actual ARM64 iPhone application
+        run: |
+          xcodebuild \
+            -project AVEAccessProbe.xcodeproj \
+            -scheme AVEAccessProbe \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/AVEProbeDerived" \
+            ARCHS=arm64 \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+      - name: Package unsigned IPA for Windows sideloading
+        run: |
+          mkdir -p "$RUNNER_TEMP/ave-package/Payload"
+          cp -R "$RUNNER_TEMP/AVEProbeDerived/Build/Products/Release-iphoneos/AVEAccessProbe.app" "$RUNNER_TEMP/ave-package/Payload/"
+          cd "$RUNNER_TEMP/ave-package"
+          zip -qr "$GITHUB_WORKSPACE/AVEAccessProbe-Unsigned.ipa" Payload
+          unzip -t "$GITHUB_WORKSPACE/AVEAccessProbe-Unsigned.ipa" | tail -1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AVEAccessProbe-Unsigned
+          path: AVEAccessProbe-Unsigned.ipa
+          if-no-files-found: error
