@@ -18,7 +18,7 @@ struct AVEAccessProbeApp: App {
                 VStack(alignment: .leading, spacing: 16) {
                     Text("AVE / VideoToolbox diagnostics")
                         .font(.title2.bold())
-                    Text("Tests direct driver access and standard hardware-accelerated H.264 / HEVC video encoding. No unsafe frame sizes, exploit payloads, or firmware changes.")
+                    Text("Inspects available video encoders and the implementation IDs selected for H.264 / HEVC. All operations use documented video APIs; no exploits or firmware changes.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                     ScrollView {
@@ -30,7 +30,20 @@ struct AVEAccessProbeApp: App {
                     }
                     .background(Color(uiColor: .secondarySystemBackground))
                     .clipShape(RoundedRectangle(cornerRadius: 12))
-                    Button("Run VideoToolbox test (NEW)") {
+                    Button("Identify video encoder (V3 NEW)") {
+                        encoding = true
+                        report = "Reading available video encoders and selected encoder IDs…"
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            let result = VideoToolboxIdentityProbe.run()
+                            DispatchQueue.main.async {
+                                report = result
+                                encoding = false
+                            }
+                        }
+                    }
+                    .disabled(encoding)
+                    .buttonStyle(.borderedProminent)
+                    Button("Run hardware encode test (V2)") {
                         encoding = true
                         report = "Running 2 normal hardware-video encode tests. Please wait…"
                         DispatchQueue.global(qos: .userInitiated).async {
@@ -43,7 +56,7 @@ struct AVEAccessProbeApp: App {
                     }
                     .disabled(encoding)
                     .buttonStyle(.borderedProminent)
-                    Button("Run original connection check") { report = AVEProbe.run() }
+                    Button("Run original connection check (V1)") { report = AVEProbe.run() }
                         .disabled(encoding)
                         .buttonStyle(.bordered)
                     Button("Copy results") { UIPasteboard.general.string = report }
@@ -292,5 +305,118 @@ enum VideoToolboxProbe {
         lines.append("CompleteFrames: OSStatus \(completion)")
         lines.append(state.summary())
         return lines
+    }
+}
+
+
+// VIDEO TOOLBOX DIAGNOSTIC V3
+// Uses only Apple's documented encoder-list / encoder-selection interfaces.
+// IDs refer to VideoToolbox encoders; they do NOT expose a kernel driver
+// call stack, user-client entitlement, or vulnerability reachability.
+enum VideoToolboxIdentityProbe {
+    static func run() -> String {
+        var result = [
+            "AVE Access Probe 3.0 | Encoder implementation IDs",
+            "iOS \(UIDevice.current.systemVersion)",
+            "Read-only VideoToolbox enumeration + safe session metadata",
+            ""
+        ]
+
+        // Registered/available encoders (not necessarily the selected one).
+        var available: CFArray?
+        let listStatus = VTCopyVideoEncoderList(nil, &available)
+        result.append("VTCopyVideoEncoderList: OSStatus \(listStatus)")
+        if listStatus == noErr, let available {
+            let count = CFArrayGetCount(available)
+            result.append("Registered encoders: \(count)")
+            if count > 0 {
+                for index in 0..<min(count, 40) {
+                    guard let entryPointer = CFArrayGetValueAtIndex(available, index) else { continue }
+                    let entry = Unmanaged<CFDictionary>
+                        .fromOpaque(UnsafeMutableRawPointer(mutating: entryPointer))
+                        .takeUnretainedValue()
+                    let name = field(entry, key: kVTVideoEncoderList_DisplayName)
+                        ?? field(entry, key: kVTVideoEncoderList_EncoderName)
+                        ?? "unknown"
+                    let codec = field(entry, key: kVTVideoEncoderList_CodecName) ?? "unknown"
+                    let identifier = field(entry, key: kVTVideoEncoderList_EncoderID) ?? "unavailable"
+                    let hardware = field(entry, key: kVTVideoEncoderList_IsHardwareAccelerated) ?? "unavailable"
+                    result.append("- \(name) [\(codec)]")
+                    result.append("  ID: \(identifier)")
+                    result.append("  Hardware flag: \(hardware)")
+                }
+            }
+        } else {
+            result.append("The current process/OS did not return an encoder list.")
+        }
+
+        for (name, codec) in [("H.264", kCMVideoCodecType_H264),
+                              ("HEVC / H.265", kCMVideoCodecType_HEVC)] {
+            result.append("")
+            result.append("=== Selected \(name) implementation ===")
+            let hardwareSpec: [String: Any] = [
+                kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder as String: true
+            ]
+            var selectedID: CFString?
+            let selectionStatus = VTCopySupportedPropertyDictionaryForEncoder(
+                width: 640,
+                height: 480,
+                codecType: codec,
+                encoderSpecification: hardwareSpec as CFDictionary,
+                encoderIDOut: &selectedID,
+                supportedPropertiesOut: nil
+            )
+            result.append("VTCopySupportedPropertyDictionaryForEncoder: OSStatus \(selectionStatus)")
+            if let selectedID {
+                result.append("Selected encoder ID (preflight): \(selectedID)")
+            } else {
+                result.append("Selected encoder ID (preflight): unavailable")
+            }
+
+            // Also ask the actual compression session for its selected encoder.
+            var session: VTCompressionSession?
+            let createStatus = VTCompressionSessionCreate(
+                allocator: kCFAllocatorDefault,
+                width: 640,
+                height: 480,
+                codecType: codec,
+                encoderSpecification: hardwareSpec as CFDictionary,
+                imageBufferAttributes: nil,
+                compressedDataAllocator: nil,
+                outputCallback: nil,
+                refcon: nil,
+                compressionSessionOut: &session
+            )
+            result.append("VTCompressionSessionCreate: OSStatus \(createStatus)")
+            if createStatus == noErr, let session {
+                var selectedProperty: CFTypeRef?
+                let propertyStatus = VTSessionCopyProperty(
+                    session,
+                    key: kVTCompressionPropertyKey_EncoderID,
+                    allocator: kCFAllocatorDefault,
+                    valueOut: &selectedProperty
+                )
+                result.append("Session EncoderID property: OSStatus \(propertyStatus)")
+                if propertyStatus == noErr, let selectedProperty {
+                    result.append("Session encoder ID: \(selectedProperty)")
+                } else {
+                    result.append("Session encoder ID: unavailable")
+                }
+                VTCompressionSessionInvalidate(session)
+            }
+        }
+        result.append("")
+        result.append("NOTE: Identifiers do not prove AppleAVE2 is the backing driver or that a vulnerable function is reachable.")
+        result.append("No video frames, private kernel methods or exploit inputs were sent.")
+        return result.joined(separator: "\n")
+    }
+
+    private static func field(_ dictionary: CFDictionary, key: CFString) -> String? {
+        let rawKey = Unmanaged.passUnretained(key).toOpaque()
+        guard let rawValue = CFDictionaryGetValue(dictionary, rawKey) else { return nil }
+        let value = Unmanaged<AnyObject>
+            .fromOpaque(UnsafeMutableRawPointer(mutating: rawValue))
+            .takeUnretainedValue()
+        return String(describing: value)
     }
 }
